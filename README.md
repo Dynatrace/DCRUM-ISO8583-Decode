@@ -12,7 +12,7 @@ The script enables you to monitor the applications using the ISO 8583 protocol t
 
 ## Where can I find the newest version of the ISO 8583 script?
 
-See the [Universal Decode Implementations](https://community.dynatrace.com/community/display/PUBDCRUM/Universal+Decode+Implementations#UniversalDecodeImplementations-ISO8583)
+See the [Universal Decode Implementations](https://community.dynatrace.com/community/display/PUBDCRUM/Bespoke+application+monitoring+with+the+Universal+Decode#BespokeapplicationmonitoringwiththeUniversalDecode-ISO8583)
 page.
 
 ## How can I run the script from sources?
