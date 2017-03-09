@@ -1,5 +1,5 @@
 --[[
-Copyright © 2015 Dynatrace LLC. 
+Copyright © 2017 Dynatrace LLC. 
 All rights reserved. 
 Unpublished rights reserved under the Copyright Laws of the United States.
 
@@ -15,1179 +15,654 @@ Use of this product is subject to the terms and conditions of the user's License
 See the license agreement text online at https://community.dynatrace.com/community/download/attachments/5144912/dynaTraceES.txt?version=3&modificationDate=1441261483927&api=v2
 --]]
 require 'amd'
-
+require 'struct'
 -- script name --
 function script_name()
   return "ISO8583Parser"
 end
 
-function string.tohex(str)
-    return (str:gsub('.', function (c)
-        return string.format('%02X', string.byte(c))
-    end))
-end
+local LogFlag = 0     --0 to turn logging off, 1 to turn it on
+local taskParm = 4    --Parameter to use in order to set the CAS Task name for an operation
+local MTIbeg = 3      --number of characters into the payload where the MTI code begins
+local MTIend = 6      --number of characters into the payload where the MTI code ends
+local errorAttrib = 0 --CAS OA 1 - error attribute
+local warnAttrib = 1  --CAS OA 2 - warning attribute
+local acceptAttrib = 2  --CAS OA 3 - accept card txn
+local denyAttrib = 3    --CAS OA 4 - deny card txn
+local denyRetainAttrib = 4  --CAS OA 5 - deny and retain card attrib
+local functionCodeBit = 24    --bit used to determine if there is a funciton code
+local actionCodeBit = 39      --bit used to determine if there is an action code
+local usernameBit = 42        --bit used to determine if there is a username set
+local stanBit = 11        -- bit used to determine if there is a System trace audit number (STAN)
 
-function MTI_Name(wrkstr)
-  operName = ''
-  if wrkstr == "0100" then operName = "Authorization Request - "..wrkstr    
-  elseif wrkstr == "0110" then operName = "Request Response - "..wrkstr   
-  elseif wrkstr == "0120" then operName = "Authorization Advice - "..wrkstr
-  elseif wrkstr == "0121" then operName = "Authorization Advice Repeat - "..wrkstr
-  elseif wrkstr == "0130" then operName = "Issuer Response to Authorization Advice - "..wrkstr
-  elseif wrkstr == "0200" then operName = "Acquirer Financial Request - "..wrkstr
-  elseif wrkstr == "0210" then operName = "Issuer Response to Financial Request - "..wrkstr
-  elseif wrkstr == "0220" then operName = "Acquirer Financial Advice - "..wrkstr
-  elseif wrkstr == "0221" then operName = "Acquirer Financial Advice repeat - "..wrkstr
-  elseif wrkstr == "0230" then operName = "Issuer Response to Financial Advice - "..wrkstr
-  elseif wrkstr == "0320" then operName = "Batch Upload - "..wrkstr
-  elseif wrkstr == "0330" then operName = "Batch Upload Response - "..wrkstr
-  elseif wrkstr == "0400" then operName = "Acquirer Reversal Request - "..wrkstr
-  elseif wrkstr == "0420" then operName = "Acquirer Reversal Advice - "..wrkstr
-  elseif wrkstr == "0421" then operName = "Acquirer Reversal Advice Repeat Message - "..wrkstr
-  elseif wrkstr == "0500" then operName = "Batch Settlement request - "..wrkstr
-  elseif wrkstr == "0510" then operName = "Batch Settlement response - "..wrkstr
-  elseif wrkstr == "0800" then operName = "Network Management Request - "..wrkstr
-  elseif wrkstr == "0810" then operName = "Network Management Response - "..wrkstr
-  elseif wrkstr == "0820" then operName = "Keychange - "..wrkstr
-  else operName = "??????" 
-  end
-end
+local fixedPayloadBegin = 7
+local fixedHexLength = 16          --length of the fixed payload in hex
+local varPayloadBegin = fixedPayloadBegin + fixedHexLength          --should be immediatly after the fixedpayload length
 
-function Log_It(logstr)
+
+
+-- MTIcodes look up table - reported in task parameter
+local MTIcodes = {
+  [1100] = "Authorization Request",
+  [1101] = "Authorization Request Repeat",
+  [1110] = "Authorization Request Response",
+  [1120] = "Authorization Advice",
+  [1121] = "Authorization Advice Repeat",
+  [1130] = "Authorization Advice Response",
+  [1140] = "Authorization Notification",
+  [1200] = "Financial Transaction Request",
+  [1201] = "Financial Transaction Request Repeat",
+  [1210] = "Financial Transaction Request Response",
+  [1220] = "Financial Transaction Advice",
+  [1230] = "Financial Transaction Advice Response",
+  [1240] = "Financial Transaction Notification",
+  [1304] = "File Action Request",
+  [1305] = "File Action Request Repeat",
+  [1314] = "File Action Request Response",
+  [1324] = "File Action Advice",
+  [1325] = "File Action Advice Repeat",
+  [1334] = "File Action Advice Response",
+  [1420] = "Reversal Advice",
+  [1421] = "Reversal Advice Repeat",
+  [1430] = "Reversal Advice Response",
+  [1440] = "Reversal Notification",
+  [1644] = "Administrative Notification",
+  [1804] = "Network Management Request",
+  [1805] = "Network Management Request Repeat",
+  [1814] = "Network Management Request Response"
+  }
+
+-- Function code look up table - Repored in Operation name  
+local functionCodes = {
+  [100] = "Original authorization - amount accurate", 
+  [101] = "Original authorization - amount estimated", 
+  [102] = "Replacement authorization - amount accurate",
+  [103] = "Replacement authorization - amount estimated",
+  [104] = "Resubmission - amount accurate",
+  [105] = "Resubmission - amount estimated",
+  [106] = "Supplementary authorization - amount accurate",
+  [107] = "Supplementary authorization - amount estimated",
+  [108] = "Inquiry",
+  [172] = "Recurring Payment",
+  [200] = "Original financial request/advice",
+  [201] = "Previously approved authorization - amount same",
+  [202] = "Previously approved authorization - amount differs",
+  [203] = "Resubmission of a previously denied financial request",
+  [204] = "Resubmission of a previously reversed financial transaction",
+  [205] = "First representment",
+  [206] = "Second representment",
+  [207] = "Third or subsequent representment",
+  [208] = "Representment reversal",
+  [300] = "File unassigned",
+  [301] = "Add record or add/update record (for AEGN Network Exception File updates)",
+  [302] = "Change record",
+  [303] = "Delete record",
+  [304] = "Replace record (this is an add that switches to a change record if the record already exists on file)",
+  [305] = "Inquire on the Card data source",
+  [306] = "Replace file",
+  [307] = "Add file",
+  [308] = "Delete file",
+  [309] = "Card administration",
+  [400] = "Full reversal, transaction did not complete as approved",
+  [401] = "Partial reversal, transaction did not complete for full amount",
+  [450] = "First full chargeback",
+  [451] = "Second full chargeback",
+  [452] = "Third full chargeback",
+  [453] = "First partial chargeback",
+  [454] = "Second partial chargeback",
+  [455] = "Third partial chargeback",
+  [456] = "First full chargeback reversal",
+  [457] = "Second full chargeback reversal",
+  [459] = "First partial chargeback reversal",
+  [460] = "Second partial chargeback reversal",
+  [650] = "Unable to parse message",
+  [801] = "System condition/sign-on",
+  [802] = "System condition/sign-off",
+  [809] = "System security/key request (outbound key)",
+  [810] = "System security/key request (inbound key)",
+  [811] = "System security/key change (both keys)",
+  [817] = "System security/key change (outbound key)",
+  [818] = "System security/key change (inbound key)",
+  [819] = "System condition/sign on acquirer only processor",
+  [820] = "System condition/sign on Issuer only processor",
+  [821] = "System accounting/cutover (future)",
+  [822] = "System accounting/checkpoint (future)",
+  [823] = "System condition/sign off acquirer only processor",
+  [824] = "System condition/sign off Issuer only processor",
+  [831] = "System audit control/echo test"
+  }
+  
+  
+  --Action Code look up table - Report in  Operation Attribute (ADS equired to view vmessage)
+local actionCodes = {
+  [000] = "Approved", 
+  [001] = "Honor with identification",
+  [002] = "Approved for partial amount",
+  [003] = "Approved (VIP)",
+  [004] = "Approved, update Track 3",
+  [005] = "Approved, account type specified by card issuer",
+  [006] = "Approved for partial amount, account type specified by card issuer",
+  [007] = "Approved, update ICC",
+  [070] = "Customer-specific approval codes",
+  [071] = "Customer-specific approval codes",
+  [072] = "Customer-specific approval codes",
+  [073] = "Customer-specific approval codes",
+  [074] = "Customer-specific approval codes",
+  [075] = "Customer-specific approval codes",
+  [076] = "Customer-specific approval codes",
+  [077] = "Customer-specific approval codes",
+  [078] = "Customer-specific approval codes",
+  [079] = "Customer-specific approval codes",
+  [080] = "Approved, backup",
+  [081] = "Approved, overdraft",
+  [082] = "Approved, surcharge",
+  [083] = "Approved, OAR",
+  [084] = "Approved, no EMV script",
+  [085] = "Approved, administration transaction, outside the balance cutover window",
+  [086] = "Approved, administration transaction, anytime balance cutover window",
+  [087] = "Purchase amount only, no cash back allowed",
+  [100] = "Denied, do not honor",
+  [101] = "Denied, expired card",
+  [102] = "Denied, suspected fraud",
+  [103] = "Denied, card acceptor contact acquirer",
+  [104] = "Denied, restricted card",
+  [105] = "Denied, card acceptor call acquirer’s security department",
+  [106] = "Denied, allowable PIN tries exceeded",
+  [107] = "Denied, refer to card issuer",
+  [108] = "Denied, refer to card issuer’s special conditions",
+  [109] = "Denied, invalid merchant",
+  [110] = "Denied, invalid amount",
+  [111] = "Denied, invalid card number",
+  [112] = "Denied, PIN data required",
+  [113] = "Denied, unacceptable fee",
+  [114] = "Denied, no account of type requested",
+  [115] = "Denied, requested function not supported",
+  [116] = "Denied not sufficient funds",
+  [117] = "Denied, incorrect PIN",
+  [118] = "Denied, no card record",
+  [119] = "Denied, transaction not permitted to cardholder",
+  [120] = "Denied, transaction not permitted to terminal",
+  [121] = "Denied, exceeds withdrawal amount limit",
+  [122] = "Denied, security violation",
+  [123] = "Denied, exceeds withdrawal frequency limit",
+  [124] = "Denied, violation of law",
+  [125] = "Denied, card not effective",
+  [126] = "Denied, invalid PIN block",
+  [127] = "Denied, PIN length error",
+  [128] = "Denied, PIN key synchronization error",
+  [129] = "Denied, suspected counterfeit card",
+  [130] = "Deny, transaction over the limit",
+  [146] = "Deny, CVV or CVC failure",
+  [160] = "Hot Card",
+  [161] = "Temporary Card Block",
+  [162] = "Restricted Card Status",
+  [163] = "Exceeded Txn Declines",
+  [168] = "ARQC failed, decline, return card",
+  [169] = "ARQC failed, refer",
+  [170] = "CVR failed, decline, return card",
+  [171] = "CVR failed, refer",
+  [172] = "TVR failed, decline, return card",
+  [173] = "TVR failed, refer",
+  [174] = "ATC failed, decline, return card",
+  [175] = "ATC failed, refer",
+  [176] = "Denied, fallback check",
+  [177] = "Referred, fallback check",
+  [180] = "Denied, amount not found",
+  [181] = "Denied, PIN change required",
+  [182] = "Denied, new PIN invalid",
+  [183] = "Denied, issuer/bank not found",
+  [184] = "Denied, issuer/bank not effective",
+  [185] = "Denied, customer/vendor not found",
+  [186] = "Denied, customer/vendor not effective",
+  [187] = "Denied, customer/vendor account invalid",
+  [188] = "Denied, vendor not found",
+  [189] = "Denied, vendor not effective",
+  [190] = "Denied, vendor data invalid",
+  [191] = "Denied, payment data invalid",
+  [192] = "Denied, personal information not found",
+  [193] = "Denied, scheduled transaction already exists",
+  [194] = "Denied, user not allowed to perform the requested function",
+  [195] = "Denied, print mini-statement instead",
+  [196] = "Denied, no statement data available",
+  [197] = "Deny, card activation declined",
+  [200] = "Retain card, do not honor",
+  [201] = "Retain card, expired card",
+  [202] = "Retain card, suspected fraud",
+  [203] = "Retain card, card acceptor contact acquirer",
+  [204] = "Retain card, restricted card",
+  [205] = "Retain card, card acceptor call acquirer’s security department",
+  [206] = "Retain card, allowable PIN tries exceeded",
+  [207] = "Retain card, special conditions",
+  [208] = "Retain card, lost card",
+  [209] = "Retain card, stolen card",
+  [210] = "Retain card, suspected counterfeit card",
+  [280] = "ARQC failed, decline, retain card",
+  [281] = "CVR failed, decline, retain card",
+  [282] = "TVR failed, decline, retain card",
+  [283] = "ATC failed, decline, retain card",
+  [284] = "Fallback check, decline, retain card",
+  [300] = "Successful",
+  [301] = "Not supported by receiver",
+  [302] = "Unable to locate record on file",
+  [303] = "Duplicate record, old record replaced",
+  [304] = "Field edit error",
+  [305] = "File locked out",
+  [306] = "Not successful",
+  [307] = "Format error",
+  [308] = "Duplicate, new record rejected",
+  [309] = "Unknown file",
+  [400] = "Reversal accepted",
+  [481] = "Reversal, original transaction not found",
+  [484] = "Reversal, original transaction not approved",
+  [500] = "Reconciled, in balance",
+  [501] = "Reconciled, out of balance",
+  [502] = "Amount not reconciled, totals provided",
+  [503] = "Totals not available",
+  [504] = "Not reconciled, totals provided",
+  [600] = "Accepted",
+  [601] = "Not able to trace back original transaction",
+  [602] = "Invalid reference number",
+  [603] = "Reference number/PAN incompatible",
+  [604] = "POS photograph is not available",
+  [605] = "Item supplied",
+  [606] = "Request cannot be fulfilled—required/requested documentation is not available",
+  [607] = "Out of window",
+  [700] = "Accepted",
+  [751] = "Approved, exceeded limit",
+  [800] = "Accepted",
+  [900] = "Advice acknowledged, no financial liability accepted",
+  [901] = "Advice acknowledged, financial liability accepted",
+  [902] = "Invalid transaction",
+  [903] = "Re-enter transaction",
+  [904] = "Format error",
+  [905] = "Acquirer not supported by switch",
+  [906] = "Cutover in process",
+  [907] = "Card issuer or switch inoperative",
+  [908] = "Transaction destination cannot be found for routing",
+  [909] = "System malfunction",
+  [910] = "Card issuer signed off",
+  [911] = "Card issuer timed out",
+  [912] = "Card issuer unavailable",
+  [913] = "Duplicate transmission",
+  [914] = "Not able to trace back to original transaction",
+  [915] = "Reconciliation cutover or checkpoint error",
+  [916] = "MAC incorrect",
+  [917] = "MAC key synchronization error",
+  [918] = "No communication keys available for use",
+  [919] = "Encryption key synchronization error",
+  [920] = "Security software/hardware error, try again",
+  [921] = "Security software/hardware error, no action",
+  [922] = "Message number out of sequence",
+  [923] = "Request in progress",
+  [940] = "Database error",
+  [941] = "Currency code not supported",
+  [942] = "Amount format error",
+  [943] = "Customer/vendor format error",
+  [944] = "Data format error",
+  [945] = "Name format error",
+  [946] = "Account format error",
+  [947] = "Recurring data error",
+  [948] = "Update not allowed",
+  [949] = "Invalid capture (posting) date",
+  [950] = "Violation of business arrangement",
+  [992] = "Vendor authorization failed",
+  [993] = "Vendor authorization rejected",
+  [994] = "Vendor customer ID invalid",
+  [995] = "Vendor customer account limit reached",
+  [996] = "Vendor system unavailable"
+  }
+
+--[[list of the length of the data elements in the variable payload
+    numbers show the lentgh of the fields
+    99 is two digit veriable length fields
+    999 are three digit variable length fields ]]--
+local dataElementsLength = {
+  16, 99, 6, 12, 12, 12, 10, 8, 8, 8,
+  6, 12, 4, 4, 6, 4, 4, 4, 3, 3,
+  3, 12, 3, 3, 4, 4, 1, 6, 3, 24,
+  99, 99, 99, 99, 99, 99, 12, 6, 3, 3,
+  16, 15, 99, 99, 99, 999, 999, 999, 3, 3,
+  3, 16, 99, 999, 999, 99, 3, 99, 999, 999,
+  999, 999, 999, 16 }
+
+local function Log_It(logstr)
   if LogFlag > 0 then 
-    print('Logging: '..logstr)
+    amd.print(string.format("%s", logstr))
   end
 end
 
-local function unpack_number(pstr, offset, size)
-  local number = 0
-  local max = size - 1
+local function toBinaryString(hexString)
+  local bitStr = ''
+  local j
   
-  for i = 0, max do
-    number = number * 256
-    number = (number + pstr:byte(offset + i))
-  end
-  return number
-end
-
-local function unpack_length(pstr, offset, size)
-  local number = 0
-  local offset2 = offset + size -1
-  local max = size - 1
-  for i = 0, max do
-    number = number * 256
-    number = (number + pstr:byte(offset2 - i))
-  end
-  return number
-end
-
-function case_2(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('02 -- Account len: '.. x ..' Account # '..pstr:sub(offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_3(pstr, offset)
-  Log_It('03 -- Procesing Code: ' .. string.sub(pstr, offset, offset+5))
-  offSet = offSet + 6
-  return 0
-end
-
-function case_4(pstr, offset)
-  Log_It('04 -- Amount - Transaction: ' .. string.sub(pstr, offset, offset+11))
-  offSet = offSet + 12
-  return 0
-end
-
-function case_5(pstr, offset)
-  Log_It('05 -- Amount - Settlement: ' .. string.sub(pstr, offset, offset+11))
-  offSet = offSet + 12
-  return 0
-end
-
-function case_6(pstr, offset)
-  Log_It('06 -- Amount - Cardholder Billing: ' .. string.sub(pstr, offset, offset+11))
-  offSet = offSet + 12
-  return 0
-end
-
-function case_7(pstr, offset)
-  Log_It('07 -- Transmission date& time: ' .. string.sub(pstr, offset, offset+9))
-  offSet = offSet + 10
-  return 0
-end
-function case_8(pstr, offset)
-  Log_It('08 -- Amount - Cardholder Billing Fee: ' .. string.sub(pstr, offset, offset+7))
-  offSet = offSet + 8
-  return 0
-end
-
-function case_9(pstr, offset)
-  Log_It('09 -- Conversion rate, Settlement: ' .. string.sub(pstr, offset, offset+7))
-  offSet = offSet + 8
-  return 0
-end
-
-function case_10(pstr, offset)
-  Log_It('10 -- Conversion rate, cardholder billing: ' .. string.sub(pstr, offset, offset+7))
-  offSet = offSet + 8
-  return 0
-end
-
-function case_11(pstr, offset)
-  Log_It('11 -- System rtrace audit number: ' .. string.sub(pstr, offset, offset+5))
-  offSet = offSet + 6
-  return 0
-end
-
-function case_12(pstr, offset)
-  Log_It('12 -- Time, local transcaton (hhmmss) ' .. string.sub(pstr, offset, offset+5))
-  offSet = offSet + 6
-  return 0
-end
-
-function case_13(pstr, offset)
-  Log_It('13 -- Date, local transaction (MMDD): ' .. string.sub(pstr, offset, offset+3))
-  offSet = offSet + 4
-  return 0
-end
-
-function case_14(pstr, offset)
-  Log_It('14 -- Date, expiration: ' .. string.sub(pstr, offset, offset+3))
-  offSet = offSet + 4
-  return 0
-end
-
-function case_15(pstr, offset)
-  Log_It('15 -- Date, settlement: ' .. string.sub(pstr, offset, offset+3))
-  offSet = offSet + 4
-  return 0
-end
-
-function case_16(pstr, offset)
-  Log_It('16 -- Date, conversion: ' .. string.sub(pstr, offset, offset+3))
-  offSet = offSet + 4
-  return 0
-end
-
-function case_17(pstr, offset)
-  Log_It('17 -- Date, capute: ' .. string.sub(pstr, offset, offset+3))
-  offSet = offSet + 4
-  return 0
-end
-
-function case_18(pstr, offset)
-  Log_It('18 -- Merchant type: ' .. string.sub(pstr, offset, offset+3))
-  offSet = offSet + 4
-  return 0
-end
-
-function case_19(pstr, offset)
-  Log_It('19 -- Aquiring Country code: ' .. string.sub(pstr, offset, offset+2))
-  offSet = offSet + 3
-  return 0
-end
-
-function case_20(pstr, offset)
-  Log_It('20 -- PAN extended country code: ' .. string.sub(pstr, offset, offset+2))
-  offSet = offSet + 3
-  return 0
-end
-
-function case_21(pstr, offset)
-  Log_It('21 -- Forwarding institution country code: ' .. string.sub(pstr, offset, offset+2))
-  offSet = offSet + 3
-  return 0
-end
-
-function case_22(pstr, offset)
-  Log_It('22 -- Point of service entry mode: ' .. string.sub(pstr, offset, offset+2))
-  offSet = offSet + 3
-  return 0
-end
-
-function case_23(pstr, offset)
-  Log_It('23 -- Application PAN sequence number: ' .. string.sub(pstr, offset, offset+2))
-  offSet = offSet + 3
-  return 0
-end
-
-function case_24(pstr, offset)
-  Log_It('24 -- Function Code : ' .. string.sub(pstr, offset, offset+2))
-  offSet = offSet + 3
-  return 0
-end
-
-function case_25(pstr, offset)
-  Log_It('25 -- Point of service condition code: ' .. string.sub(pstr, offset, offset+1))
-  offSet = offSet + 2
-  return 0
-end
-
-function case_26(pstr, offset)
-  Log_It('26 -- Point of service capture code: ' .. string.sub(pstr, offset, offset+1))
-  offSet = offSet + 2
-  return 0
-end
-
-function case_27(pstr, offset)
-  Log_It('27 -- Authorizing ID responce length: ' .. string.sub(pstr, offset, offset))
-  offSet = offSet + 1
-  return 0
-end
-
-function case_28(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('28 -- Len: '.. x ..' Amount Transaction fee: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_29(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('29 -- Len: '.. x ..' Amount Settlement fee: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_30(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('30 -- Len: '.. x ..' Amount Transaction Processing fee: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_31(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('31 -- Len: '.. x ..' Amount settlement Processing fee: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_32(pstr, offset) 
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('32 -- Len: '.. x ..' Acquiring Institution ID code: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-function case_33(pstr, offset) 
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('33 -- Len: '.. x ..' Forwarding Institution ID code: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_34(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('34 -- Len: '.. x ..' Primary account number extended: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_35(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('35 -- Len: '.. x ..' Track 2 Data: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_36(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('36 -- Len: '.. x ..' Track 3 Data: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_37(pstr, offset)
-  Log_It('37 -- Retrieval reference number: ' .. string.sub(pstr, offset, offset+11))
-  offSet = offSet + 12
-  return 0
-end
-
-function case_38(pstr, offset)
-  Log_It('38 -- Authorization identification responce: ' .. string.sub(pstr, offset, offset+5))
-  offSet = offSet + 6 
-  return 0
-end
-
-function case_39(pstr, offset)
-  Log_It('39 -- Response Code: ' .. string.sub(pstr, offset, offset+1))
-  retCode = pstr:sub(offset, offset+1)
-  offSet = offSet + 2
-  return 0
-end
-
-function case_40(pstr, offset)
-  Log_It('40 -- Service Restriction code: ' .. string.sub(pstr, offset, offset+2))
-  offSet = offSet + 3
-  return 0
-end
-
-function case_41(pstr, offset)
-  Log_It('41 -- Card acceptor terminal ID: ' .. string.sub(pstr, offset, offset+7))
-  offSet = offSet + 8
-  return 0
-end
-
-function case_42(pstr, offset) 
-  Log_It('42 -- Card acceptor ID code: ' .. string.sub(pstr, offset, offset+14))
-  uname = pstr:sub(offset, offset+14)
-  uname = uname:gsub("%s+", "")
-  uname = uname:gsub("^0+", "")
-  Log_It('---uname:'.. uname);
-  offSet = offSet + 15
-  return 0
-end
-
-function case_43(pstr, offset)
-  Log_It('43 -- Card acceptor name/location: ' .. string.sub(pstr, offset, offset+39))
-  offSet = offSet + 40
-  return 0
-end
-
-function case_44(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('44 -- Len: '.. x ..' Additional responce data: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_45(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('45 -- Len: '.. x ..' Track 1 Data: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_46(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('46 -- Len: '.. x ..' Additional Data ISO: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_47(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('47 -- Len: '.. x ..' Additional Data national: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_48(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('48 -- Len: '.. x ..' Additional Data private: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_49(pstr, offset)
-  Log_It('49 -- Currency code transcation: ' .. string.sub(pstr, offset, offset+2))
-  offSet = offSet + 3 
-  return 0
-end
-
-function case_50(pstr, offset)
-  Log_It('50 -- Currency code settlement: ' .. string.sub(pstr, offset, offset+2))
-  offSet = offSet + 3
-  return 0
-end
-
-function case_51(pstr, offset)  
-  Log_It('51 -- Currency code cardholder: ' .. string.sub(pstr, offset, offset+2))
-  offSet = offSet + 3 
-  return 0
-end
-
-function case_52(pstr, offset)
-  Log_It('52 hex-:'.. string.tohex(string.sub(pstr, offset, offset+15))) 
-  Log_It('52 -- Personal ID number data: ' .. string.sub(pstr, offset, offset+15))
-  offSet = offSet + 16
-  return 0
-end
-
-function case_53(pstr, offset)
-  Log_It('53 -- Security related control infomation: ' .. string.sub(pstr, offset, offset+15))
-  offSet = offSet + 14; 
-  return 0
-end
-
-function case_54(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('54 -- Len: '.. x ..' Additional amounts: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_55(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('55 -- Len: '.. x ..' Reserved ISO: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_56(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('56 -- Len: '.. x ..' Reserved ISO: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_57(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('57 -- Len: '.. x ..' Reserved national: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_58(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('58 -- Len: '.. x ..' Reserved national: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_59(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('59 -- Len: '.. x ..' Reserved national: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_60(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('60 -- Len: '.. x ..' Reserved national: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_61(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('61 -- Len: '.. x ..' Reserved private: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_62(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('62 -- Len: '.. x ..' Reserved private: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_63(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('63 -- Len: '.. x ..' Reserved private: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_64(psrt, offset)
-   Log_It('64 -- MAC: ' .. string.sub(pstr, offset, offset+3))
-  offSet = offSet + 4
-  return 0
-  end
-
-function case_65(pstr, offset)
-  Log_It('65 -- Bitmap: ' .. string.sub(pstr, offset, offset))
-  offSet = offSet + 1
-  return 0
-end
-
-function case_66(pstr, offset)
-  Log_It('66 -- Settlement Code: ' .. string.sub(pstr, offset, offset))
-  offSet = offSet + 1
-  return 0
-end
-
-function case_67(pstr, offset)
-  Log_It('67 -- Extend payment Code: ' .. string.sub(pstr, offset, offset+1))
-  offSet = offSet + 2
-  return 0
-end
-
-function case_68(pstr, offset)
-  Log_It('68 -- receiving country Code: ' .. string.sub(pstr, offset, offset+2))
-  offSet = offSet + 3
-  return 0
-end
-
-function case_69(pstr, offset)
-  Log_It('69 -- settlement country Code: ' .. string.sub(pstr, offset, offset+2))
-  offSet = offSet + 3
-  return 0
-end
-
-function case_70(pstr, offset)
-  Log_It('70 -- network management information code: ' .. string.sub(pstr, offset, offset+2))
-  offSet = offSet + 3
-  return 0
-end
-
-function case_71(pstr, offset)
-  Log_It('71 -- Message number: ' .. string.sub(pstr, offset, offset+3))
-  offSet = offSet + 4
-  return 0
-end
-
-function case_72(pstr, offset)
-  Log_It('72 -- message number last: ' .. string.sub(pstr, offset, offset+3))
-  offSet = offSet + 4
-  return 0
-end
-
-function case_73(pstr, offset)
-  Log_It('73 -- Date: ' .. string.sub(pstr, offset, offset+5))
-  offSet = offSet + 6
-  return 0
-end
-
-function case_74(pstr, offset)
-  Log_It('74 -- Credits number: ' .. string.sub(pstr, offset, offset+9))
-  offSet = offSet + 10
-  return 0
-end
-
-function case_75(pstr, offset)
-  Log_It('75 -- Credits recersal number: ' .. string.sub(pstr, offset, offset+9))
-  offSet = offSet + 10
-  return 0
-end
-
-function case_76(pstr, offset)
-  Log_It('76 -- Debits number: ' .. string.sub(pstr, offset, offset+9))
-  offSet = offSet + 10 
-  return 0
-end
-
-function case_77(pstr, offset)
-  Log_It('77 -- Debits reveral number: ' .. string.sub(pstr, offset, offset+9))
-  offSet = offSet + 10 
-  return 0
-end
-
-function case_78(pstr, offset)
-  Log_It('78 -- Transfer Number: ' .. string.sub(pstr, offset, offset+9))
-  offSet = offSet + 10 
-  return 0
-end
-
-function case_79(pstr, offset)
-  Log_It('78 -- Transfer Reversal Number: ' .. string.sub(pstr, offset, offset+9))
-  offSet = offSet + 10 
-  return 0
-end
-
-function case_80(pstr, offset)
-  Log_It('80 -- Inquiries Number: ' .. string.sub(pstr, offset, offset+9))
-  offSet = offSet + 10 
-  return 0
-end
-
-function case_81(pstr, offset)
-  Log_It('81 -- Authorizations Number: ' .. string.sub(pstr, offset, offset+9))
-  offSet = offSet + 10 
-  return 0
-end
-
-function case_82(pstr, offset)
-  Log_It('82 -- Credit Proessing fee amount: ' .. string.sub(pstr, offset, offset+11))
-  offSet = offSet + 12 
-  return 0
-end
-
-function case_83(pstr, offset)
-  Log_It('83 -- Credit transaction fee amount: ' .. string.sub(pstr, offset, offset+11))
-  offSet = offSet + 12
-  return 0
-end
-
-function case_84(pstr, offset)
-  Log_It('84 -- Debits Proessing fee amount: ' .. string.sub(pstr, offset, offset+11))
-  offSet = offSet + 12
-  return 0
-end
-
-function case_85(pstr, offset)
-  Log_It('85 -- Debits Transaction fee amount: ' .. string.sub(pstr, offset, offset+11))
-  offSet = offSet + 12
-  return 0
-end
-
-function case_86(pstr, offset)
-  Log_It('86 -- Credits  amount: ' .. string.sub(pstr, offset, offset+15))
-  offSet = offSet + 16
-  return 0
-end
-
-function case_87(pstr, offset)
-  Log_It('87 -- Credits reversal amount: ' .. string.sub(pstr, offset, offset+15))
-  offSet = offSet + 16
-  return 0
-end
-
-function case_88(pstr, offset)
-  Log_It('88 -- Debits  amount: ' .. string.sub(pstr, offset, offset+15))
-  offSet = offSet + 16
-  return 0
-end
-
-function case_89(pstr, offset)
-  Log_It('89 -- Debits reversal amount: ' .. string.sub(pstr, offset, offset+15))
-  offSet = offSet + 16
-  return 0
-end
-
-function case_90(pstr, offset)
-  Log_It('90 -- Original data elements ' .. string.sub(pstr, offset, offset+41))
-  offSet = offSet + 42
-  return 0
-end
-
-function case_91(pstr, offset)
-  Log_It('91 -- File update code: ' .. string.sub(pstr, offset, offset))
-  offSet = offSet + 1
-  return 0
-end
-
-function case_92(pstr, offset)
-  Log_It('92 -- File security code: ' .. string.sub(pstr, offset, offset+1))
-  offSet = offSet + 2
-  return 0
-end
-function case_93(pstr, offset)
-  Log_It('93 -- Responce indicator: ' .. string.sub(pstr, offset, offset+4))
-  offSet = offSet + 5
-  return 0
-end
-
-function case_94(pstr, offset)
-  Log_It('94 -- Service indicator: ' .. string.sub(pstr, offset, offset+6))
-  offSet = offSet + 7
-  return 0
-end
-
-function case_95(pstr, offset)
-  Log_It('95 -- replacement amounts: ' .. string.sub(pstr, offset, offset+41))
-  offSet = offSet + 42
-  return 0
-end
-
-function case_96(pstr, offset)
-  Log_It('------ special check data --------')
-  Log_It('96 -- Message security code: ' .. string.sub(pstr, offset, offset+7))
-  offSet = offSet + 8
-  return 0
-end
-
-function case_97(pstr, offset)
-  Log_It('97 -- Amount net settlement: ' .. string.sub(pstr, offset, offset+15))
-  offSet = offSet + 16
-  return 0
-end
-
-function case_98(pstr, offset)
-  Log_It('98 -- Payee: ' .. string.sub(pstr, offset, offset+24))
-  offSet = offSet + 25
-  return 0
-end
-
-function case_99(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('99 -- Len: '.. x ..' Settlement ID code: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_100(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('100 -- Len: '.. x ..' Receiving ID code: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_101(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('101 -- Len: '.. x ..' File name: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_102(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('102 -- Len: '.. x ..' Account ID 1 '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_103(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('103 -- Len: '.. x ..' Account ID 2 '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_104(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('104 -- Len: '.. x ..' Transaction Description '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_105(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('105 -- Len: '.. x ..'Reserved for ISO '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_106(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('106 -- Len: '.. x ..'Reserved for ISO '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-end
-
-function case_107(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('107 -- Len: '.. x ..'Reserved for ISO '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_108(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('108 -- Len: '.. x ..'Reserved for ISO '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_109(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('109 -- Len: '.. x ..'Reserved for ISO '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_110(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('110-- Len: '.. x ..'Reserved for ISO '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_111(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('111 -- Len: '.. x ..'Reserved for ISO '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_112(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('112 -- Len: '.. x ..'Reserved for national '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_113(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('113 -- Len: '.. x ..'Reserved for national '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_114(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('114 -- Len: '.. x ..'Reserved for national '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_115(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('115 -- Len: '.. x ..'Reserved for national '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_116(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('116 -- Len: '.. x ..'Reserved for national '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_117(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('117 -- Len: '.. x ..'Reserved for national '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_118(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('118 -- Len: '.. x ..'Reserved for national '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_119(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('119 -- Len: '.. x ..'Reserved for national '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_120(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('120 -- Len: '.. x ..'Reserved for private: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_121(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('121 -- Len: '.. x ..'Reserved for private: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_122(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('122 -- Len: '.. x ..'Reserved for private: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_123(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('123 -- Len: '.. x ..'Reserved for private: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_124(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('124 -- Len: '.. x ..'Reserved for private: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_125(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('125 -- Len: '.. x ..'Reserved for private: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_126(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('126 -- Len: '.. x ..'Reserved for private: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_127(pstr, offset)
-  local x = tonumber(string.sub(pstr, offset, offset+1))
-  Log_It('127 -- Len: '.. x ..'Reserved for private: '..string.sub(pstr, offset+2, offset+1+x))
-  offSet = offSet + 2 + x
-  return 0
-end
-
-function case_128(pstr, offset)
-  Log_It('------ special check data --------')
-  Log_It('128 -- Message auth code: ' .. string.sub(pstr, offset, offset+7))
-  offSet = offSet + 8
-  return 0
-end
-
-function findfunction(x)
-  assert(type(x) == "string")
-  local f=_G
-  for v in x:gmatch("[^%.]+") do
-    if type(f) ~= "table" then
-       Log_It('---nil one')
-       return nil, "looking for '"..v.."' expected table, not "..type(f)
+  for j = 1, #hexString do                    --for the length of the string convert it to bits
+  char = string.sub(hexString, j, j) 
+  --Log_It ('char: '.. char)       
+    if char == '0' then bitStr = bitStr .. "0000"
+    elseif char == '1' then bitStr = bitStr .. "0001"
+    elseif char == '2' then bitStr = bitStr .. "0010"
+    elseif char == '3' then bitStr = bitStr .. "0011"
+    elseif char == '4' then bitStr = bitStr .. "0100"
+    elseif char == '5' then bitStr = bitStr .. "0101"
+    elseif char == '6' then bitStr = bitStr .. "0110"
+    elseif char == '7' then bitStr = bitStr .. "0111"
+    elseif char == '8' then bitStr = bitStr .. "1000"
+    elseif char == '9' then bitStr = bitStr .. "1001"
+    elseif char == 'A' then bitStr = bitStr .. "1010"
+    elseif char == 'B' then bitStr = bitStr .. "1011"
+    elseif char == 'C' then bitStr = bitStr .. "1100"
+    elseif char == 'D' then bitStr = bitStr .. "1101"
+    elseif char == 'E' then bitStr = bitStr .. "1110"
+    elseif char == 'F' then bitStr = bitStr .. "1111"
     end
-    f=f[v]
   end
-  if type(f) == "function" then
-    return f
-  else
-    Log_It('---nil TWO')
-    return nil, "expected function, not "..type(f)
-  end
+--  Log_It('BitStr: '.. bitStr)
+  return bitStr
 end
 
-  LogFlag = 0
-  hexChar = 0
-  hexLen = 0
-  hexStr = ''
-  bitStr = ''
-  bitLen = 0
-  offSet = 0
-  uname = ''
-  IDcode = ''
-  operName = ''
-  MTIstr  = ''
-  ClientType = ''
-  ClientTypeStr= ''
-  MsgClass = ''
-  retCode = ''
+local function processDataElements(varPayload, bitStr, limit)
+  local j
+  local bit
+  local codeLen
+  local fCode = ''
+  local aCode = 'notset'
+  local uname = ''
+  local offset = 1
+  local varOffset = 0
+  local stan 
   
- function parse_request(payload, stats)
+  local fieldRange = limit and math.min(limit, #bitStr) or #bitStr 
+    
+  for j=1, fieldRange do                   --for the length of the bitStr which is the fixed payload in bits
+    bit = string.sub(bitStr, j, j)      -- get the bit value
+    if bit == '1' then                  -- if fixed field set then the variable data has information that must be processed
+      if dataElementsLength[j] then     --make sure the length is retrieved from the dataelemtnslength table
+        codeLen = dataElementsLength[j]  --set the codeLen to the value from the table
+        if codeLen < 99 then              --for all non variable length elements
+          if j == functionCodeBit then fCode = varPayload:sub(offset, offset+codeLen-1)    --when processing bit 24 get the function code
+          elseif j == actionCodeBit then aCode = varPayload:sub(offset, offset+codeLen-1)    --when at processing 39 get the action code
+          elseif j == usernameBit then 
+            uname = varPayload:sub(offset, offset+codeLen-1)
+            uname = uname:gsub("%s+", "")
+            uname = uname:gsub("^0+", "")
+          elseif j == stanBit then 
+            stan = varPayload:sub(offset, offset+codeLen-1)
+          end
+        offset = offset + codeLen             --move the varpayload offset past the current field
+        elseif codeLen == 99 then                                         --two digit variable length field
+          varOffset = tonumber(string.sub(varPayload, offset, offset+1))  --get the length of the field from the first 2 digits in the field
+          offset = offset + 2 + varOffset                                 --move the offset to after the length of the field
+        elseif codeLen == 999 then                                         --two digit variable length field
+          varOffset = tonumber(string.sub(varPayload, offset, offset+2))  --get the length of the field from the first 3 digits in the field
+          offset = offset + 2 + varOffset                                 --move the offset to after the length of the field
+        end
+      else   --dataelement field not recognized
+        Log_It('Error: data field length not recognized')
+        stats:setAttribute(errorAttrib, 'Data Processing error - data element length field not recognized')  
+      end      --processing the data elements and moving the offset
+    end     --processing if a bit is set to 1
+  end  --for - processing each bit in the bit string
+  return fCode, aCode, uname, stan
+end
 
-  Log_It('Parse Request')
-  if payload:len() == 0 then
+
+function parse_request_unsafe(payload, stats)
+  Log_It('--------------------------------------- Request Processing Started -----------------------------------------')
+  local MTIno        --Message Type Identifier string
+  local MTImsg       --MTI String converted to the MTI code associated with the number
+  local operName = 'Unknown'     --Operation name will be set as unknown for now and pulled from the response
+                     --this is in case the operation name is not set later, can't have task set with no operation name
+  local taskName     --text used to set the CAS Task value
+  
+  if payload:len() == 0 then    --ensure there is some payload to process
+    Log_It('No Request Payload to process')
     return 1
   end
   
-  uname = ''
-  ClientType = ''
-  ClientTypeStr = ''
-  MsgClass = ''
-  MsgClassStr = ''
-  bitStr = ''
-  pgmStr =''
-  xstr = ''
+  MTIno = string.sub(payload, MTIbeg, MTIend)     --pull the MTI code from the payload
+  MTImsg = MTIcodes[tonumber(MTIno)]              --Look up the extracted MTI number to get the message string
+  Log_It('MTI number is: ' .. MTIno)
+
+  if MTImsg then                                  --if the message is retrieved using the MTI number  
+    taskName = MTImsg .. ' (' .. MTIno .. ')'     --set the taskname for the CAS
+    Log_It('Task Name: '.. taskName .. '\nOperation name: ' .. operName)
+    stats:setParameter(taskParm, taskName)
+  else                                            --Code lookup failed - no message associated with the MTI number
+    taskName = "Unknown Message Type: " .. '(' .. MTIno .. ')'
+    Log_It('MTI number not recognized\n Task Name: '.. taskName .. '\n Operation name: ' .. operName)
+    stats:setParameter(taskParm, taskName)
+  end
+  stats:setOperationName(operName, operName:len())  --set operation name so a task is not set without an operation set
   
-  Log_It('------------------------------------------------------------------------------------------------------') 
-  Log_It('FF------:'.. string.tohex(string.sub(payload, 1, 1)))
-  Log_It('Len hex-:'.. string.tohex(string.sub(payload, 2, 3))) 
-  Log_It('Len-----:'.. unpack_length(payload, 2, 2) )
-  MTIstr = string.sub(payload, 4, 7)
-  MTI_Name(MTIstr)
-  
-  if operName == "??????" then 
-    print('ISO8583 -- Invalid MTI:' .. string.tohex(MTIstr))
-    print(' Request PL len--:'.. payload:len()) 
-    print(' Request payload-:'.. string.tohex(payload:sub(0, payload:len())))  
+  Log_It('--------------------------------------- Request Processing Complete -----------------------------------------') 
+  return 0  
+end
+
+
+function parse_response_unsafe(payload, stats)
+  Log_It('--------------------------------------- Response Processing Started -----------------------------------------')
+  local MTIno        --Message Type Identifier string
+  local MTImsg       --MTI String converted to the MTI code associated with the number
+  local operName = 'Unknown'     --Operation name will be set as unknown for now but will be set from function codes
+  local taskName     --text used to set the CAS Task value
+  local rejectedTask  --task set in the request that is recieved the 1644, rejected response       
+  local fixedPayload
+  local varPayload
+  local attrNo
+  local fixedPayloadBitStr
+  local functionCode = ''                 --used to set the page name - number retrieved from payload
+  local actionCode = ''                    --used to set the operation attribute - number retrieved from payload
+  local uname = ''
+  local functionMsg = ''                --text to set the function code
+  local actionMsg = ''                  --text to set the action code
+  local actionCodeNo = 0                --action code stored as a number
+  local stan =''
+      
+  if payload:len() == 0 then    --ensure there is some payload to process
+    Log_It('No Response Payload to process')
     return 1
+  end
+
+  taskName = stats:getParameter(taskParm)         --get the taskname that was set in the request processing
+  MTIno = string.sub(payload, MTIbeg, MTIend)     --pull the MTI code from the payload
+  MTImsg = MTIcodes[tonumber(MTIno)]              --Look up the extracted MTI number to get the message string
+  Log_It('MTI number in response: ' .. MTIno)
+
+  if not taskName then                            --if the taskname was not set in the process request it will be set from the response
+    stats:setOperationName(operName, operName:len())  --set operation name so a task is not set without an operation set
+    if MTImsg then                                  --if the message is retrieved using the MTI number from the response
+      taskName = 'Unmatched Response: ' .. MTImsg .. ' (' .. MTIno .. ')'     --set the taskname for the CAS
+      Log_It('MTI task name from response: '.. taskName)
+      stats:setParameter(taskParm, taskName)
+    else                                            --Code lookup failed - no message associated with the MTI number
+      taskName = "Unmatched and Unknown Message Type: " .. '(' .. MTIno .. ')'
+      Log_It('MTI number not recognized\n Task Name: '.. taskName)
+      stats:setParameter(taskParm, taskName)
+  end
+  elseif MTIno == '1644' then               --Requested task recived a 1644 Code - Rejected message by the server
+    rejectedTask = 'Rejected Message: ' .. taskName     --set the old task in the error OA
+    taskName = MTImsg .. ' (' .. MTIno .. ')' .. ' - Rejected Message'    --set the new task name from response
+    Log_It('Rejected Taskname: ' .. taskName .. '\nRejected message: ' .. rejectedTask)
+    stats:setParameter(taskParm, taskName)                                --set task name
+    stats:setAttribute(errorAttrib, rejectedTask)                         --set the error operation attribute for the CAS
+  end
+  Log_It('Taskname is: '.. taskName)
+
+  fixedPayload = string.sub(payload, fixedPayloadBegin, varPayloadBegin-1) -- fixedpayload bitstring determines what fields are in the varPayload--
+  varPayload = string.sub(payload, varPayloadBegin, payload:len()) --variable length payload - values of all the fields that are set
+  fixedPayloadBitStr = toBinaryString(fixedPayload)   --fixed payload converted to bits to see which data fields exist
+  Log_It('\tThe fixed payload is: ' .. fixedPayload .. '\n\tThe var payload is: ' .. varPayload .. '\n\tThe Fixed payload in bits is: ' .. fixedPayloadBitStr)
+
+   --[[the functionCode and actionCode and usernames are in different positions depending on fixedPayload bitstring
+       processDataElements retrieves the correct codes from the correct positions using the bitmap in the fixedpayload bitstring ]]--
+  functionCode, actionCode, uname, stan = processDataElements(varPayload, fixedPayloadBitStr)
+  Log_It('\tThe function code is: ' .. functionCode .. '\n\tThe action code is: ' .. actionCode .. '\n\tThe username is: ' .. uname)
+
+  if (type(uname) == "string" and uname:len() > 0 and uname ~= '')  then    --check to see if username is set
+--    Log_It('Username: '.. uname)
+    stats:setUserName(uname)                                --pass back the username
+  end  
+  
+  functionMsg = functionCodes[tonumber(functionCode)]     --lookup the functioncode number in the table and get the message text
+  if functionMsg then                                       --for a successful lookup
+    functionMsg = functionMsg .. ' (' .. functionCode .. ')'    --set the text to have the message and number
+  else                                                       --function message not found from the code
+    functionMsg = 'Unknown Function Code: ' .. '(' .. functionCode .. ')'
+  end
+  Log_It('Function Message: '.. functionMsg)
+  stats:setOperationName(functionMsg, functionMsg:len())
+
+  actionMsg = actionCodes[tonumber(actionCode)]           --lookup the action code number in the table and get the action text
+  if actionMsg then                                       --if the message was retrieved
+    actionMsg = actionMsg .. ' (' .. actionCode .. ')'    --set the action message to include the code number
+    actionCodeNo = tonumber(actionCode)                   --convert the action code to a number instead of a string
+    if actionCodeNo >= 100 and actionCodeNo <= 199  then  --determine which OA to set based on the action code number
+      attrNo = denyAttrib
+      elseif actionCodeNo >= 200 and actionCodeNo <= 299  then
+      attrNo = denyRetainAttrib
+      elseif actionCodeNo >= 301 and actionCodeNo <= 399  then
+      attrNo = acceptAttrib
+      elseif actionCodeNo >= 601 and actionCodeNo <= 699  then
+      attrNo = warnAttrib
+      elseif actionCodeNo >= 948 and actionCodeNo <= 949  then
+      attrNo = warnAttrib
+      elseif actionCodeNo >= 994 and actionCodeNo <= 995  then
+      attrNo = warnAttrib
+      elseif actionCodeNo >= 902 and actionCodeNo <= 922  then
+      attrNo = warnAttrib
+      elseif actionCodeNo >= 950 and actionCodeNo <= 993  then
+      attrNo = warnAttrib
+      elseif actionCodeNo == 940 or actionCodeNo == 947 or actionCodeNo == 996 then
+      attrNo = errorAttrib
+      else
+      attrNo = acceptAttrib
+    end    
+  else      --action code not matched in the action message table
+    if actionCode ~= 'notset' then
+      actionMsg = 'Unknown Action Code' .. ' (' .. actionCode .. ')'
+      attrNo = errorAttrib
+    else
+      actionMsg = 'Action Code: ' .. actionCode
+      attrNo = warnAttrib
+    end
+  end
+  Log_It('Action Mesage: ' .. actionMsg .. '\tAttribute Number' .. attrNo)
+  stats:setAttribute(attrNo, actionMsg)
+  Log_It('--------------------------------------- Response Processing Complete -----------------------------------------') 
+  return 0  
+end
+
+
+
+
+function messageHandlers()
+  return {"IsoMessages", "IsoHits"}
+end
+
+IsoMessages = {}
+IsoHits = {}
+
+function IsoHits.trySync()
+  return true
+end
+
+function IsoHits.processDirectionSwitch(mh)
+end
+
+function IsoHits.parseMessage(mh)
+  mh:messageComplete(mh:currentBlock():length())
+    
+  local payload = mh:currentBlock():c_str()
+  local request = payload:sub(5,5) == '0' or payload:sub(5,5) == '2' or payload:sub(5,5) == '4'
+            
+  
+  mh:setRequest(request)
+  mh:setResponse(not request)
+  if not request then mh:setLast() end
+  
+  mh:pushNextLayerRange(0,mh:currentBlock():length())
+  
+end
+
+function IsoMessages.trySync(inBlock)
+  local payload = inBlock:c_str()
+  
+  -- message length less than 0x0fff (4095) bytes and  version 1993 and (request or  advice or notification)  
+  return (payload:len() > 16 and  payload:byte(1) <= 0xf  and payload:sub(3,3) ==  '1'  and
+            ( 
+              payload:sub(5,5) == '0'
+              or payload:sub(5,5) == '2' 
+              or payload:sub(5,5) == '4'
+            )
+          )  
+   
+end
+
+function IsoMessages.processDirectionSwitch(mh)
+end
+
+function IsoMessages.parseMessage(mh)
+  if mh:currentBlock():length() < 16 then
+    mh:needMore(16)
+    return
+  end
+  
+  local payload = mh:currentBlock():c_str()
+  local l = struct.unpack(">I2",payload:sub(1,2))
+  
+  if l >  0xfff then
+    mh:setBroken()
+    return
+  end  
+  
+  if mh:currentBlock():length() < l+2 then
+    mh:needMore(l+2)
+    return
+  end
+  
+  if payload:sub(3,3) ~=  '1' then
+    mh:setBroken()
+    return
+  end  
+  
+  
+  
+  local result, message = pcall( function ()
+      local fixedPayload = string.sub(payload, fixedPayloadBegin, varPayloadBegin-1) -- fixedpayload bitstring determines what fields are in the varPayload--
+      local varPayload = string.sub(payload, varPayloadBegin, payload:len()) --variable length payload - values of all the fields that are set
+      local fixedPayloadBitStr = toBinaryString(fixedPayload)   --fixed payload converted to bits to see which data fields exist
+      local functionCode, actionCode, uname, stan = processDataElements(varPayload, fixedPayloadBitStr, stanBit)
+      mh:setYahaSessionId(stan)
+    end)
+  if not result then
+    amd.print("ERROR" .. message)
+    mh:setBroken()
+    return  
+  end
+    
+  mh:messageComplete(l+2)
+  mh:pushNextLayerRange(0,l+2)
+  
+end
+
+function parse_request(payload, stats)
+  local result, message = pcall(parse_request_unsafe, payload,stats)
+  
+  if not result then
+    amd.print("Parsing error: " .. message)
+    stats:setOperationName("INVALID", string.len("INVALID"))
   end 
   
-
-  Log_It('MTI-----:'..operName)    
-  stats:setOperationName(operName, operName:len())
- 
-  ClientType =  string.sub(payload, 7, 7)
-    
-  if ClientType == "0" then ClientTypeStr = "Acquirer"   
-    elseif ClientType == "1" then ClientTypeStr = "Acquirer Repeat"   
-    elseif ClientType == "2" then ClientTypeStr = "Issuer" 
-    elseif ClientType == "3" then ClientTypeStr = "Issuer Repeat"  
-    elseif ClientType == "4" then ClientTypeStr = "Other"    
-    elseif ClientType == "5" then ClientTypeStr = "Other Repeat"  
-    else ClientTypeStr = "Unknown"  
-  end
-  stats:setBrowserOsHardware(ClientTypeStr, "", "", "")
-    
-    
-  MsgClass   =  string.sub(payload, 5, 5)
-  if MsgClass == "1" then MsgClassStr = "Authorization Message"  
-    elseif MsgClass == "2" then MsgClassStr = "Financial Message"  
-    elseif MsgClass == "3" then MsgClassStr = "File Actions Message"   
-    elseif MsgClass == "4" then MsgClassStr = "Reversal and Chargeback Message"   
-    elseif MsgClass == "5" then MsgClassStr = "Reconciliation Message"   
-    elseif MsgClass == "6" then MsgClassStr = "Administrative Message"
-    elseif MsgClass == "7" then MsgClassStr = "Fee Collection Message"
-    elseif MsgClass == "8" then MsgClassStr = "Network Management Message" 
-    elseif MsgClass == "9" then MsgClassStr = "Reserved By ISO" 
-    else MsgClassStr = "Unknown"
-  end
-  stats:setParameter(4, MsgClassStr) 
-  
-  Log_It('PL len--:'.. payload:len()) 
-  Log_It('payload-:'.. string.tohex(payload:sub(0, payload:len())))
-
-  if payload:byte(8) < 128 then
-    hexStr = string.tohex(string.sub(payload, 8, 15))
-    hexLen = 16  
-    bitLen = 64 
-    offSet = 16
-    Log_It ('8 byte mask: '.. hexStr) 
-  else 
-    hexStr = string.tohex(string.sub(payload, 8, 23))
-    hexLen = 32
-    bitLen = 128
-    offSet = 24
-    Log_It ('16 byte mask: '.. hexStr)
-  end
- 
-   for j = 1, hexLen do
-    hexChar = hexStr:byte(j) 
-         
-    if hexChar == 48 then  bitStr = bitStr .. "0000"
-    elseif hexChar == 49 then bitStr = bitStr .. "0001"
-    elseif hexChar == 50 then bitStr = bitStr .. "0010"
-    elseif hexChar == 51 then bitStr = bitStr .. "0011"
-    elseif hexChar == 52 then bitStr = bitStr .. "0100"
-    elseif hexChar == 53 then bitStr = bitStr .. "0101"
-    elseif hexChar == 54 then bitStr = bitStr .. "0110"
-    elseif hexChar == 55 then bitStr = bitStr .. "0111"
-    elseif hexChar == 56 then bitStr = bitStr .. "1000"
-    elseif hexChar == 57 then bitStr = bitStr .. "1001"
-    elseif hexChar == 65 then bitStr = bitStr .. "1010"
-    elseif hexChar == 66 then bitStr = bitStr .. "1011"
-    elseif hexChar == 67 then bitStr = bitStr .. "1100"
-    elseif hexChar == 68 then bitStr = bitStr .. "1101"
-    elseif hexChar == 69 then bitStr = bitStr .. "1110"
-    else                    bitStr = bitStr .. "1111"
-    end
-  end
-  
-  Log_It('BitStr: '.. bitStr)
-    
-  for j=1, bitLen do
-    hexChar = bitStr:byte(j) 
-    if hexChar == 49 then
-      if j > 1 then 
-        xstr = xstr .. ", "
-      end
-      xstr = xstr .. j     
-    end     
-  end  
- 
-  Log_It('codes to process: '.. xstr) 
- 
-  if MTIstr == "0800" or MTIstr == "0810" then
-    bitLen = 75
-  else 
-    bitLen = 49
-  end
-  
-  for j=2, bitLen do
-    hexChar = bitStr:byte(j) 
-    if hexChar == 49 then
-      pgmStr = 'case_' .. j
-      fun = findfunction(pgmStr)
-      if (fun == nil) then
-        Log_It('error no function for:'..j)
-      else
-        fun(payload, offSet)
-      end
-    end     
-  end  
-  Log_It('---uname:'.. uname);
-  stats:setUserName(uname)
-  Log_It('------------------------------------------------------------------------------------------------------') 
-  return 0
 end
 
- function parse_response(payload, stats)
-  Log_It('Parse_Response')
-  if payload:len() == 0 then
-    return 1
-  end
-
-  uname = ''
-  bitStr = ''
-  pgmStr =''
-  xstr = '' 
-  retCode = ''
+function parse_response(payload, stats)
+  local result, message = pcall(parse_response_unsafe, payload,stats)
   
-  Log_It('######################################################################################################') 
-  Log_It('FF------:'.. string.tohex(string.sub(payload, 1, 1)))
-  Log_It('Len hex-:'.. string.tohex(string.sub(payload, 2, 3))) 
-  Log_It('Len-----:'.. unpack_length(payload, 2, 2) )
-  MTIstr = string.sub(payload, 4, 7)
-  Log_It('MTI-----:'.. MTIstr)
-  MTI_Name(MTIstr)  
-  Log_It('MTI-----:'..operName)
-
-  if operName == "??????" then 
-    print('ISO8583 -- Invalid MTI:' .. string.tohex(MTIstr))
-    print('  Responce PL len--:'.. payload:len()) 
-    print('  Responce payload-:'.. string.tohex(payload:sub(0, payload:len())))  
-    return 1
+  if not result then
+    amd.print("Parsing error: " .. message)
+    stats:setOperationName("INVALID", string.len("INVALID"))
   end 
-
-  Log_It('MTI-----:'..operName)
- -- stats:setOperationName(operName, operName:len())
   
-  Log_It('PL len--:'.. payload:len()) 
-  Log_It('payload-:'.. string.tohex(payload:sub(0, payload:len())))
-
-  if payload:byte(8) < 128 then
-    hexStr = string.tohex(string.sub(payload, 8, 15))
-    hexLen = 16  
-    bitLen = 64 
-    offSet = 16
-    Log_It ('8 byte mask: '.. hexStr) 
-  else 
-    hexStr = string.tohex(string.sub(payload, 8, 23))
-    hexLen = 32
-    bitLen = 128
-    offSet = 24
-    Log_It ('16 byte mask: '.. hexStr)
-  end
- 
-  for j = 1, hexLen do
-    hexChar = hexStr:byte(j) 
-         
-    if hexChar == 48 then  bitStr = bitStr .. "0000"
-    elseif hexChar == 49 then bitStr = bitStr .. "0001"
-    elseif hexChar == 50 then bitStr = bitStr .. "0010"
-    elseif hexChar == 51 then bitStr = bitStr .. "0011"
-    elseif hexChar == 52 then bitStr = bitStr .. "0100"
-    elseif hexChar == 53 then bitStr = bitStr .. "0101"
-    elseif hexChar == 54 then bitStr = bitStr .. "0110"
-    elseif hexChar == 55 then bitStr = bitStr .. "0111"
-    elseif hexChar == 56 then bitStr = bitStr .. "1000"
-    elseif hexChar == 57 then bitStr = bitStr .. "1001"
-    elseif hexChar == 65 then bitStr = bitStr .. "1010"
-    elseif hexChar == 66 then bitStr = bitStr .. "1011"
-    elseif hexChar == 67 then bitStr = bitStr .. "1100"
-    elseif hexChar == 68 then bitStr = bitStr .. "1101"
-    elseif hexChar == 69 then bitStr = bitStr .. "1110"
-    else                    bitStr = bitStr .. "1111"
-    end
-  end
-  
-  Log_It('BitStr: '.. bitStr)
-  xstr = ''
-  
-  for j=1, bitLen do
-    hexChar = bitStr:byte(j) 
-    if hexChar == 49 then
-      if j > 1 then 
-        xstr = xstr .. ", "
-      end
-      xstr = xstr .. j     
-    end     
-  end  
- 
-  Log_It('codes to process: '.. xstr) 
-
-  pgmStr ="" 
-  
-  if MTIstr == "0800" or MTIstr == "0810" then
-    bitLen = 75
-  else 
-    bitLen = 49
-  end
-  
-  for j=2, bitLen do
-    hexChar = bitStr:byte(j) 
-    if hexChar == 49 then
-      pgmStr = 'case_' .. j
-      fun = findfunction(pgmStr)
-      if (fun == nil) then
-        Log_It('error no function for:'..j)
-      else
-        fun(payload, offSet)
-      end
-    end     
-  end  
-    
-  Log_It('---uname:'.. uname)
-  stats:setUserName(uname)
-  if retCode ~= "00" then
-    err = 'Error Return Code (' ..retCode.. ')'
-    stats:setAttribute(0, err)
-  end
-  
-  Log_It('######################################################################################################') 
-  return 0
 end
 
 local the_module = {}
