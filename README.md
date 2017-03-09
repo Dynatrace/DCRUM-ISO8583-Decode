@@ -1,6 +1,8 @@
 # ISO 8583 script for DC RUM
 
-The script enables you to monitor the applications using the ISO 8583 protocol to exchange electronic transactions made by cardholders using payment cards. Two versions of the protocol are supported ISO 8583:1993 and ISO 8583:2003 - choose one of the two scripts depending on your protocol version. The scripts report the operation names and messages issued in the communication.
+The script enables you to monitor the applications using the ISO 8583 protocol to exchange electronic transactions made by cardholders using the payment cards. Two versions of the protocol are supported, ISO 8583:1993 and ISO 8583:2003 - choose one of the two scripts depending on your protocol version. The scripts report the operation names and messages issued in the communication.
+
+Note that the ISO 8583:1993 script provides versatile means of analysis and can be used as a starting template for new implementations. On the other hand, ISO 8583:2003  is just an example, based on limited scenarios which may not be sufficient to use is as a base for further development.
 
 ## What is Dynatrace DC RUM?
 
@@ -8,7 +10,12 @@ The script enables you to monitor the applications using the ISO 8583 protocol t
 
 ## Which DC RUM versions are compatible with the ISO 8583 script?
 
-12.3 or later, Classic AMD.
+ * ISO 8583:1993 - AMD HS
+ * ISO 8583:2003 - 12.3 or later, Classic AMD.
+
+## Prerequisites
+
+The script for the ISO 8583:1993 protocol requires a 16-bit big-endian message length prefix. Requests are matched with responses using unique values of the "System trace audit number (STAN)" field.
 
 ## Where can I find the newest version of the ISO 8583 script?
 
